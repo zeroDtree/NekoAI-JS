@@ -98,7 +98,7 @@ describe("withRetry", () => {
       async () => {
         attempts++;
         if (attempts < 3) {
-          throw new NovelAIApiError(429, "Too Many Requests");
+          throw new NovelAIApiError(502, "Bad Gateway");
         }
         return "ok";
       },
@@ -106,6 +106,36 @@ describe("withRetry", () => {
     );
     expect(result).toBe("ok");
     expect(attempts).toBe(3);
+  });
+
+  it("does not retry 429 by default", async () => {
+    let attempts = 0;
+    await expect(
+      withRetry(
+        async () => {
+          attempts++;
+          throw new NovelAIApiError(429, "Too Many Requests");
+        },
+        { baseDelay: 1 },
+      ),
+    ).rejects.toThrow(/429/);
+    expect(attempts).toBe(1);
+  });
+
+  it("does not retry timeouts by default", async () => {
+    let attempts = 0;
+    await expect(
+      withRetry(
+        async () => {
+          attempts++;
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          throw error;
+        },
+        { baseDelay: 1 },
+      ),
+    ).rejects.toThrow(/aborted/);
+    expect(attempts).toBe(1);
   });
 
   it("does not retry non-retryable errors", async () => {
@@ -128,7 +158,7 @@ describe("withRetry", () => {
       withRetry(
         async () => {
           attempts++;
-          throw new NovelAIApiError(429, "Too Many Requests");
+          throw new NovelAIApiError(502, "Bad Gateway");
         },
         { enabled: false },
       ),

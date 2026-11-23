@@ -22,15 +22,29 @@ export class Image {
   readonly data: Uint8Array;
 
   /**
+   * Seed reported by the JSON response, when available.
+   */
+  readonly seed?: number;
+
+  /**
+   * Index of this image in the response batch.
+   */
+  readonly index?: number;
+
+  /**
    * Create a new Image instance
    *
    * @param options - Configuration options for the image
    * @param options.filename - The filename of the image
    * @param options.data - Raw binary data of the image
+   * @param options.seed - Seed reported by the JSON response
+   * @param options.index - Index in the response batch
    */
   constructor(options: ImageOptions) {
     this.filename = options.filename;
     this.data = options.data;
+    this.seed = options.seed;
+    this.index = options.index;
   }
 
   /**
@@ -145,6 +159,7 @@ export class Image {
 export enum EventType {
   INTERMEDIATE = "intermediate",
   FINAL = "final",
+  ERROR = "error",
 }
 
 /**

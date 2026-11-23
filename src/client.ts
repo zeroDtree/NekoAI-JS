@@ -8,56 +8,67 @@ import {
   EmotionOptions,
   EmotionLevel,
   Model,
+  StreamingType,
   TextModel,
   isV4Model,
   isV5Model,
 } from "./constants";
-import { Image, MsgpackEvent, EventType } from "./image";
+import { Image, MsgpackEvent } from "./image";
 import {
   ChatCompletion,
   ChatCompletionChunk,
   ChatMessage,
   Completion,
+  CompletionPrompt,
   DirectorRequest,
+  EncodeVibeOptions,
+  EncodeVibeRequest,
   EnhanceOptions,
+  GenerateImageOptions,
+  GenerateVoiceOptions,
+  ImageGenerationJsonResponse,
   ImageInput,
+  LMGenerationResponse,
   Metadata,
+  NativeTextOptions,
   NovelAIOptions,
-  NovelAIResponse,
-  RetryConfig,
+  OAITokenCountResponse,
+  OpenAIModelInfo,
+  OpenAIModelsResponse,
   TagSuggestion,
   TextGenerationOptions,
+  UpscaleOptions,
+  VoiceResult,
 } from "./types";
 import {
-  apiErrorFromResponse,
+  buildImagePayload,
   calculateCost,
   createFilename,
+  decodeBufferedImageResponse,
+  decodeImageStream,
   getNodeFs,
-  handleResponse,
+  imageExtension,
   isNodeEnvironment,
+  NovelAIStreamError,
   parseImage,
-  prepareMetadataForApi,
-  prepHeaders,
   SSEStream,
-  StreamingMsgpackParser,
-  StreamingSSEParser,
-  parseStreamEvents,
   scaleDimensions,
   timestampString,
   uint8ArrayToBase64,
-  withRetry,
 } from "./utils";
+import { NovelAITransport } from "./utils/transport";
 import { metadataProcessor } from "./metadata";
 
 /** Maximum number of vibe tokens kept in the in-memory cache */
 const VIBE_CACHE_LIMIT = 100;
 
+const DECLARED_BLUR_SIGMAS = [0, 0.3, 0.35, 0.4, 0.45, 0.5] as const;
+
 /**
  * Detect whether a base64 string is an actual image (needing vibe encoding)
- * rather than a pre-encoded vibe token
+ * rather than a pre-encoded vibe token.
  */
 function isEncodableImage(base64: string): boolean {
-  // Base64 prefixes of PNG, JPEG, WebP/RIFF and GIF magic bytes
   return ["iVBOR", "/9j/", "UklGR", "R0lGO"].some((magic) =>
     base64.startsWith(magic),
   );
@@ -65,7 +76,7 @@ function isEncodableImage(base64: string): boolean {
 
 /**
  * Copy of a request payload with bulky base64 fields replaced by size
- * annotations, for verbose logging
+ * annotations, for verbose logging.
  */
 function redactPayload(payload: any): any {
   const params = payload?.parameters;
@@ -75,7 +86,7 @@ function redactPayload(payload: any): any {
     typeof value === "string" ? `<base64: ${value.length} chars>` : value;
 
   const redacted: any = { ...params };
-  for (const key of ["image", "mask"]) {
+  for (const key of ["image", "mask", "reference_image"]) {
     if (redacted[key] !== undefined) redacted[key] = redact(redacted[key]);
   }
   for (const key of ["reference_image_multiple", "director_reference_images"]) {
@@ -87,152 +98,160 @@ function redactPayload(payload: any): any {
 }
 
 /**
- * NovelAI client for image generation, director tools and text generation
+ * NovelAI client for image generation, Director tools, text and voice.
  */
 export class NovelAI {
   private token: string;
   private host: string;
   private textHost: string;
   private timeout: number;
-  private retryConfig?: RetryConfig;
-
-  private verbose: boolean = false;
-  private headers: Record<string, string>;
+  private verbose: boolean;
+  private transport: NovelAITransport;
 
   /**
-   * Cache of vibe tokens to avoid re-encoding the same images
+   * Cache of vibe tokens to avoid re-encoding the same images.
    */
   private vibeCache: Map<string, string> = new Map();
 
-  /**
-   * Create a new NovelAI client
-   *
-   * @param options - Client configuration options
-   * @param options.token - NovelAI access token
-   * @param options.host - API host for image endpoints (default: Host.WEB)
-   * @param options.textHost - API host for text endpoints (default: Host.TEXT)
-   * @param options.timeout - Request timeout in milliseconds (default: 120000)
-   * @param options.retry - Configuration for request retries (default: enabled with 3 retries)
-   * @param options.verbose - Whether to log additional information (default: false)
-   */
   constructor(options: NovelAIOptions) {
     this.token = options.token;
-    this.host = options.host || Host.WEB;
+    this.host = options.host || Host.IMAGE;
     this.textHost = options.textHost || Host.TEXT;
     this.timeout = options.timeout || 120000;
-    this.retryConfig = options.retry;
     this.verbose = options.verbose || false;
 
-    this.headers = {
-      ...HEADERS,
-      Authorization: `Bearer ${this.token}`,
-    };
+    this.transport = new NovelAITransport({
+      headers: {
+        ...HEADERS,
+        Authorization: `Bearer ${this.token}`,
+      },
+      timeout: this.timeout,
+      retry: options.retry,
+      verbose: this.verbose,
+    });
   }
 
   /**
-   * Generate images using NovelAI's API
+   * Generate images.
    *
    * @param metadata - Generation parameters
-   * @param stream - Whether to stream intermediate steps (V4/V5 models only, default: false)
-   * @param isOpus - Whether the user has Opus subscription (for cost estimation logging, default: false)
-   * @param forceZip - Route V4 models through the ZIP endpoint instead of the event stream (default: false)
-   * @returns Array of Image objects, or an AsyncGenerator of MsgpackEvent objects when streaming
+   * @param options - Streaming / response-format options
    */
-  generateImage(metadata: Metadata): Promise<Image[]>;
   generateImage(
     metadata: Metadata,
-    stream: false,
-    isOpus?: boolean,
-    forceZip?: boolean,
+    options?: GenerateImageOptions & { stream?: false },
   ): Promise<Image[]>;
   generateImage(
     metadata: Metadata,
-    stream: true,
-    isOpus?: boolean,
+    options: GenerateImageOptions & { stream: true },
   ): Promise<AsyncGenerator<MsgpackEvent, void, unknown>>;
-  generateImage(
-    metadata: Metadata,
-    stream: boolean,
-    isOpus?: boolean,
-    forceZip?: boolean,
-  ): Promise<Image[] | AsyncGenerator<MsgpackEvent, void, unknown>>;
   async generateImage(
     metadata: Metadata,
-    stream: boolean = false,
-    isOpus: boolean = false,
-    forceZip: boolean = false,
+    options: GenerateImageOptions = {},
   ): Promise<Image[] | AsyncGenerator<MsgpackEvent, void, unknown>> {
     const resolved = await this.resolveImageInputs(metadata);
     const processedMetadata = metadataProcessor.processMetadata(resolved);
+    const model = processedMetadata.model!;
+
+    if (options.stream && !isV4Model(model)) {
+      throw new Error(
+        "Streaming is only supported for V4/V5 models; V3 models return the final image only.",
+      );
+    }
 
     if (this.verbose) {
-      if (isV5Model(processedMetadata.model!)) {
+      if (isV5Model(model)) {
         console.info("Generating V5 image; check account usage for cost");
       } else {
-        const cost = calculateCost(processedMetadata, isOpus);
+        const cost = calculateCost(processedMetadata, options.isOpus);
         console.info(`Generating image... estimated Anlas cost: ${cost}`);
       }
     }
 
-    // Encode vibe transfer reference images for V4 models
-    await this.encodeVibe(processedMetadata);
+    await this.encodeVibeMetadata(processedMetadata);
 
-    const payload = prepareMetadataForApi(processedMetadata);
-    const useEventStream = isV4Model(processedMetadata.model!) && !forceZip;
+    const payload = buildImagePayload(processedMetadata);
+    if (this.verbose) {
+      console.debug(
+        `[Image payload] ${payload.model}`,
+        JSON.stringify(redactPayload(payload)),
+      );
+    }
 
-    if (stream) {
-      if (!useEventStream) {
-        throw new Error(
-          "Streaming is only supported for V4/V5 models without forceZip; V3 models return the final image only.",
+    try {
+      if (options.stream) {
+        const streamFormat = options.streamFormat ?? StreamingType.SSE;
+        payload.parameters.stream = streamFormat;
+        const accept =
+          streamFormat === StreamingType.SSE
+            ? "text/event-stream"
+            : "application/octet-stream";
+        const { response } = await this.transport.stream(
+          `${this.host}${Endpoint.IMAGE_STREAM}`,
+          { body: payload, accept, idempotent: false },
+        );
+        return this.wrapImageStream(
+          decodeImageStream(
+            response.body!,
+            response.headers.get("content-type") ?? undefined,
+          ),
         );
       }
-      // Open the connection (with retry) before returning the generator so
-      // connection/HTTP errors are retried and surface here, not mid-iteration
-      const response = await withRetry(
-        () => this.openStream(`${this.host}${Endpoint.IMAGE_STREAM}`, payload),
-        this.retryConfig,
-      );
-      return this.parseEventStream(
-        response,
-        payload.action,
-        processedMetadata.model!,
-      );
-    }
 
-    if (!useEventStream) {
-      // The ZIP endpoint does not understand the stream parameter
-      delete payload.parameters.stream;
-    }
-
-    return withRetry(async () => {
-      try {
-        if (useEventStream) {
-          const response = await this.request(
-            `${this.host}${Endpoint.IMAGE_STREAM}`,
-            payload,
-          );
-          return await this.extractImagesFromMsgpack(response);
-        }
-        const response = await this.request(
+      if (options.format === "json") {
+        delete payload.parameters.stream;
+        const result = await this.transport.json<ImageGenerationJsonResponse>(
           `${this.host}${Endpoint.IMAGE}`,
-          payload,
+          { body: payload, accept: "application/json", idempotent: false },
         );
-        return await this.extractImagesFromZip(response);
-      } catch (error) {
-        throw this.handleRequestError(error);
+        return this.imagesFromJson(result);
       }
-    }, this.retryConfig);
+
+      delete payload.parameters.stream;
+      const { data, contentType } = await this.transport.buffer(
+        `${this.host}${Endpoint.IMAGE}`,
+        { body: payload, accept: "application/zip", idempotent: false },
+      );
+      return await decodeBufferedImageResponse(data, contentType);
+    } catch (error) {
+      throw this.handleRequestError(error);
+    }
+  }
+
+  private imagesFromJson(result: ImageGenerationJsonResponse): Image[] {
+    if (!Array.isArray(result?.images) || result.images.length === 0) {
+      throw new NovelAIStreamError("JSON image response contained no images");
+    }
+    return result.images.map((entry) => {
+      const data = Uint8Array.from(atob(entry.image), (c) => c.charCodeAt(0));
+      return new Image({
+        filename: `${timestampString()}_p${entry.index}.${imageExtension(data)}`,
+        data,
+        seed: entry.seed,
+        index: entry.index,
+      });
+    });
+  }
+
+  private async *wrapImageStream(
+    stream: AsyncGenerator<MsgpackEvent, void, unknown>,
+  ): AsyncGenerator<MsgpackEvent, void, unknown> {
+    try {
+      yield* stream;
+    } catch (error) {
+      throw this.handleRequestError(error);
+    }
   }
 
   /**
-   * Resolve all image-bearing metadata fields to raw base64 strings,
-   * accepting any supported ImageInput format.
+   * Resolve all image-bearing metadata fields to raw base64 strings.
    */
   private async resolveImageInputs(metadata: Metadata): Promise<Metadata> {
     const result: Metadata = { ...metadata };
 
     result.image = await this.resolveToBase64(result.image);
     result.mask = await this.resolveToBase64(result.mask);
+    result.reference_image = await this.resolveToBase64(result.reference_image);
 
     if (result.reference_image_multiple) {
       result.reference_image_multiple = await Promise.all(
@@ -254,9 +273,7 @@ export class NovelAI {
   }
 
   /**
-   * Convert an ImageInput to a raw base64 string.
-   * Strings are treated as data URLs, remote URLs, file paths (Node.js, when
-   * the file exists), or raw base64 (fallback) — in that order.
+   * Convert an ImageInput to raw base64.
    */
   private async resolveToBase64(
     input?: ImageInput,
@@ -277,171 +294,12 @@ export class NovelAI {
           return (await parseImage(input)).base64;
         }
       }
-      // Assume the string is already raw base64
       return input;
     }
 
     return (await parseImage(input)).base64;
   }
 
-  /**
-   * Make a buffered request to the NovelAI API.
-   * The timeout covers the time until the response is fully received.
-   */
-  private async request(
-    url: string,
-    payload: unknown,
-  ): Promise<NovelAIResponse> {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.timeout);
-
-    const jsonPayload = JSON.stringify(payload);
-    const headers = prepHeaders(this.headers);
-
-    if (this.verbose) {
-      console.debug(`[Request] ${url}`, JSON.stringify(redactPayload(payload)));
-    }
-
-    try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers,
-        body: jsonPayload,
-        signal: controller.signal,
-      });
-
-      return await handleResponse(response);
-    } finally {
-      clearTimeout(timeoutId);
-    }
-  }
-
-  /**
-   * Open a streaming request. The timeout covers time-to-headers only, so
-   * long-running streams are not aborted mid-generation.
-   */
-  private async openStream(url: string, payload: unknown): Promise<Response> {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), this.timeout);
-
-    const jsonPayload = JSON.stringify(payload);
-    const headers = prepHeaders(this.headers);
-
-    if (this.verbose) {
-      console.debug(`[Stream] ${url}`, JSON.stringify(redactPayload(payload)));
-    }
-
-    try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers,
-        body: jsonPayload,
-        signal: controller.signal,
-      });
-
-      if (!response.ok) {
-        throw await apiErrorFromResponse(response);
-      }
-      if (!response.body) {
-        throw new Error("No response body available for streaming");
-      }
-
-      return response;
-    } catch (error) {
-      throw this.handleRequestError(error);
-    } finally {
-      clearTimeout(timeoutId);
-    }
-  }
-
-  /**
-   * Parse a streaming response body into MsgpackEvent objects
-   */
-  private async *parseEventStream(
-    response: Response,
-    action: string,
-    model: Model,
-  ): AsyncGenerator<MsgpackEvent, void, unknown> {
-    // Inpainting streams SSE; everything else streams length-prefixed msgpack
-    const parser =
-      action === "infill" && !isV5Model(model)
-        ? new StreamingSSEParser()
-        : new StreamingMsgpackParser();
-
-    const reader = response.body!.getReader();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        yield* parser.feedChunk(value);
-      }
-      if (parser instanceof StreamingSSEParser) {
-        yield* parser.flush();
-      }
-    } finally {
-      reader.releaseLock();
-    }
-  }
-
-  /**
-   * Extract images from ZIP response (V3 models)
-   */
-  private async extractImagesFromZip(
-    apiResponse: NovelAIResponse,
-  ): Promise<Image[]> {
-    const arrayBuffer = await this.getResponseBuffer(apiResponse);
-    const zip = await JSZip.loadAsync(arrayBuffer);
-    const images: Image[] = [];
-    let index = 0;
-
-    for (const filename of Object.keys(zip.files)) {
-      const zipObj = zip.files[filename];
-      if (!zipObj.dir) {
-        const data = await zipObj.async("uint8array");
-        images.push(
-          new Image({
-            filename: `${timestampString()}_p${index}.png`,
-            data,
-          }),
-        );
-        index++;
-      }
-    }
-
-    return images;
-  }
-
-  /**
-   * Extract final images from a buffered event stream response (V4 models)
-   */
-  private async extractImagesFromMsgpack(
-    apiResponse: NovelAIResponse,
-  ): Promise<Image[]> {
-    const arrayBuffer = await this.getResponseBuffer(apiResponse);
-    const events = parseStreamEvents(new Uint8Array(arrayBuffer));
-
-    return events
-      .filter((event) => event.event_type === EventType.FINAL)
-      .map((event) => event.image);
-  }
-
-  /**
-   * Get response data as ArrayBuffer
-   */
-  private async getResponseBuffer(
-    apiResponse: NovelAIResponse,
-  ): Promise<ArrayBuffer> {
-    if (apiResponse.data instanceof ArrayBuffer) {
-      return apiResponse.data;
-    } else if (apiResponse.data) {
-      return await new Response(apiResponse.data).arrayBuffer();
-    }
-    throw new Error("No data received from API");
-  }
-
-  /**
-   * Convert AbortError into a friendly timeout message
-   */
   private handleRequestError(error: any): Error {
     if (error?.name === "AbortError") {
       return new Error(
@@ -452,58 +310,37 @@ export class NovelAI {
   }
 
   /**
-   * Use a Director tool with the specified request
-   *
-   * @param request - Director tool request
-   * @returns Promise resolving to an Image object
+   * Use a Director tool with the specified request.
    */
   async useDirectorTool(request: DirectorRequest): Promise<Image> {
-    return withRetry(async () => {
-      try {
-        const response = await this.request(
-          `${this.host}${Endpoint.DIRECTOR}`,
-          request,
-        );
-
-        if (!response.data) {
-          throw new Error("Received empty response from the server.");
-        }
-
-        // Buffer once — the response stream can only be consumed a single time
-        const arrayBuffer = await this.getResponseBuffer(response);
-        const data = await this.unzipSingleImage(arrayBuffer);
-
-        return new Image({
-          filename: createFilename(request.req_type),
-          data,
-        });
-      } catch (error) {
-        throw this.handleRequestError(error);
-      }
-    }, this.retryConfig);
-  }
-
-  /**
-   * Extract the first image from a single-image ZIP response, falling back
-   * to the raw bytes when the response is not a ZIP.
-   */
-  private async unzipSingleImage(
-    arrayBuffer: ArrayBuffer,
-  ): Promise<Uint8Array> {
     try {
-      const zip = await JSZip.loadAsync(arrayBuffer);
-      const firstFile = Object.values(zip.files).find((f) => !f.dir);
-      return firstFile
-        ? await firstFile.async("uint8array")
-        : new Uint8Array(arrayBuffer);
-    } catch {
-      return new Uint8Array(arrayBuffer);
+      const { data } = await this.transport.buffer(
+        `${this.host}${Endpoint.DIRECTOR}`,
+        { body: request, accept: "application/zip", idempotent: false },
+      );
+      return new Image({
+        filename: createFilename(request.req_type),
+        data: await this.unzipSingleImage(data),
+      });
+    } catch (error) {
+      throw this.handleRequestError(error);
     }
   }
 
-  /**
-   * Create a director tool request with common parameters
-   */
+  private async unzipSingleImage(
+    data: Uint8Array | ArrayBuffer,
+  ): Promise<Uint8Array> {
+    try {
+      const zip = await JSZip.loadAsync(data);
+      const firstFile = Object.values(zip.files).find((f) => !f.dir);
+      return firstFile
+        ? await firstFile.async("uint8array")
+        : new Uint8Array(data);
+    } catch {
+      return data instanceof Uint8Array ? data : new Uint8Array(data);
+    }
+  }
+
   private async createDirectorRequest(
     image: ImageInput,
     reqType: DirectorTools,
@@ -520,41 +357,22 @@ export class NovelAI {
     } as DirectorRequest);
   }
 
-  /**
-   * Convert an image to line art
-   */
   async lineArt(image: ImageInput): Promise<Image> {
     return this.createDirectorRequest(image, DirectorTools.LINEART);
   }
 
-  /**
-   * Convert an image to sketch
-   */
   async sketch(image: ImageInput): Promise<Image> {
     return this.createDirectorRequest(image, DirectorTools.SKETCH);
   }
 
-  /**
-   * Remove the background from an image
-   */
   async backgroundRemoval(image: ImageInput): Promise<Image> {
     return this.createDirectorRequest(image, DirectorTools.BACKGROUND_REMOVAL);
   }
 
-  /**
-   * Declutter an image (remove noise, distractions, etc.)
-   */
   async declutter(image: ImageInput): Promise<Image> {
     return this.createDirectorRequest(image, DirectorTools.DECLUTTER);
   }
 
-  /**
-   * Colorize a sketch or line art
-   *
-   * @param image - Image input (path, Blob, File, URL, etc.)
-   * @param prompt - Additional prompt to add to the request
-   * @param defry - Defry value (0-5, default: 0)
-   */
   async colorize(
     image: ImageInput,
     prompt: string = "",
@@ -566,14 +384,6 @@ export class NovelAI {
     });
   }
 
-  /**
-   * Change the emotion of a character in an image
-   *
-   * @param image - Image input (path, Blob, File, URL, etc.)
-   * @param emotion - Target emotion to change to
-   * @param prompt - Additional prompt to add to the request
-   * @param emotionLevel - Strength of the emotion change (default: NORMAL)
-   */
   async changeEmotion(
     image: ImageInput,
     emotion: string = EmotionOptions.NEUTRAL,
@@ -587,51 +397,51 @@ export class NovelAI {
   }
 
   /**
-   * Upscale an image using NovelAI's dedicated upscaler
-   *
-   * Note: this endpoint lives on api.novelai.net and requires an active
-   * subscription; the upscaled image is returned as-is (no re-generation).
-   *
-   * @param image - Image input (path, Blob, File, URL, etc.)
-   * @param scale - Upscale factor, 2 or 4 (default: 4)
-   * @returns Promise resolving to the upscaled Image
+   * Upscale an image using the documented standalone upscaler.
    */
-  async upscale(image: ImageInput, scale: 2 | 4 = 4): Promise<Image> {
-    const parsed = await parseImage(image);
+  async upscale(
+    image: ImageInput,
+    options: UpscaleOptions = {},
+  ): Promise<Image> {
+    const base64 = await this.resolveToBase64(image);
+    if (!base64) {
+      throw new Error("No image provided for upscaling");
+    }
 
-    return withRetry(async () => {
-      try {
-        const response = await this.request(`${Host.API}${Endpoint.UPSCALE}`, {
-          image: parsed.base64,
-          width: parsed.width,
-          height: parsed.height,
-          scale,
-        });
+    if (
+      options.declaredBlurSigma !== undefined &&
+      !DECLARED_BLUR_SIGMAS.includes(options.declaredBlurSigma)
+    ) {
+      throw new Error(
+        `declaredBlurSigma must be one of ${DECLARED_BLUR_SIGMAS.join(", ")}`,
+      );
+    }
 
-        if (!response.data) {
-          throw new Error("Received empty response from the server.");
-        }
+    const body: Record<string, unknown> = {
+      image: base64,
+      model: options.model ?? Model.V4_5,
+    };
+    if (options.declaredBlurSigma !== undefined) {
+      body.declared_blur_sigma = options.declaredBlurSigma;
+    }
 
-        const arrayBuffer = await this.getResponseBuffer(response);
-        return new Image({
-          filename: createFilename("upscaled"),
-          data: await this.unzipSingleImage(arrayBuffer),
-        });
-      } catch (error) {
-        throw this.handleRequestError(error);
+    try {
+      const { data, contentType } = await this.transport.buffer(
+        `${this.host}${Endpoint.UPSCALE}`,
+        { body, accept: "application/zip", idempotent: false },
+      );
+      const images = await decodeBufferedImageResponse(data, contentType);
+      if (images.length === 0) {
+        throw new NovelAIStreamError("Upscale response contained no image");
       }
-    }, this.retryConfig);
+      return images[0];
+    } catch (error) {
+      throw this.handleRequestError(error);
+    }
   }
 
   /**
-   * Enhance an image — img2img re-generation at a scaled-up resolution,
-   * mirroring the web UI's Enhance feature. The target resolution is the
-   * source size multiplied by upscaleFactor, clamped to the API's pixel budget.
-   *
-   * @param image - Image input (path, Blob, File, URL, etc.)
-   * @param options - Enhance options plus any generation metadata
-   *                  (upscaleFactor default 1.5, strength 0.5, noise 0)
-   * @returns Promise resolving to an array of Image objects
+   * Enhance an image — img2img re-generation at a scaled-up resolution.
    */
   async enhance(
     image: ImageInput,
@@ -657,12 +467,7 @@ export class NovelAI {
   }
 
   /**
-   * Get tag suggestions for a partial tag query
-   *
-   * @param prompt - The incomplete tag query
-   * @param model - The image model to get suggestions for (default: V4.5)
-   * @param lang - Query language, "en" or "jp" (default: "en")
-   * @returns Promise resolving to an array of tag suggestions
+   * Get tag suggestions for a partial tag query.
    */
   async suggestTags(
     prompt: string,
@@ -674,93 +479,124 @@ export class NovelAI {
     url.searchParams.set("prompt", prompt);
     if (lang) url.searchParams.set("lang", lang);
 
-    const result = await withRetry(async () => {
-      const response = await fetch(url, {
-        method: "GET",
-        headers: prepHeaders(this.headers),
-      });
-      if (!response.ok) {
-        throw await apiErrorFromResponse(response);
-      }
-      return response.json();
-    }, this.retryConfig);
+    try {
+      const result = await this.transport.json<{
+        tags?: TagSuggestion[] | TagSuggestion;
+      }>(url.toString(), { method: "GET" });
+      return this.normalizeTagSuggestions(result?.tags);
+    } catch (error) {
+      throw this.handleRequestError(error);
+    }
+  }
 
-    const tags = (result as any)?.tags;
-    return Array.isArray(tags) ? tags : [];
+  private normalizeTagSuggestions(
+    tags: TagSuggestion[] | TagSuggestion | undefined,
+  ): TagSuggestion[] {
+    if (Array.isArray(tags)) return tags;
+    if (tags && typeof tags === "object" && "tag" in tags) return [tags];
+    throw new Error("Unexpected suggest-tags response shape");
   }
 
   /**
-   * Encode images to vibe tokens using the /encode-vibe endpoint.
-   * Uses caching to avoid unnecessary API calls for previously processed images.
+   * Encode an image into a vibe-transfer token.
    */
-  private async encodeVibe(metadata: Metadata): Promise<void> {
-    if (
-      !metadata.model ||
-      !isV4Model(metadata.model) ||
-      !metadata.reference_image_multiple?.length
-    ) {
-      return;
+  async encodeVibe(
+    image: ImageInput,
+    options: EncodeVibeOptions = {},
+  ): Promise<string> {
+    const base64 = await this.resolveToBase64(image);
+    if (!base64) {
+      throw new Error("No image provided for vibe encoding");
+    }
+    return this.fetchVibeToken(base64, options);
+  }
+
+  /**
+   * Encode V4 reference images in-place before building the generation payload.
+   */
+  private async encodeVibeMetadata(metadata: Metadata): Promise<void> {
+    if (!metadata.model || !isV4Model(metadata.model)) return;
+
+    if (metadata.reference_image) {
+      const reference = metadata.reference_image as string;
+      if (isEncodableImage(reference)) {
+        metadata.reference_image = await this.fetchVibeToken(reference, {
+          model: metadata.model,
+          informationExtracted: metadata.reference_information_extracted ?? 1,
+        });
+      }
     }
 
-    const encoded: string[] = [];
+    if (!metadata.reference_image_multiple?.length) return;
 
+    const encoded: string[] = [];
     for (let i = 0; i < metadata.reference_image_multiple.length; i++) {
       const refImage = metadata.reference_image_multiple[i] as string;
-
-      // Pre-encoded vibe tokens (e.g. from .naiv4vibe files) are passed
-      // through untouched; only actual images are sent to /encode-vibe
       if (!isEncodableImage(refImage)) {
         encoded.push(refImage);
         continue;
       }
 
-      const refInfoExtracted =
-        metadata.reference_information_extracted_multiple?.[i] ?? 1.0;
-
-      const imageHash = await this.getImageHash(refImage);
-      const cacheKey = `${imageHash}:${refInfoExtracted}:${metadata.model}`;
-
-      let vibeToken = this.vibeCache.get(cacheKey);
-      if (!vibeToken) {
-        vibeToken = await this.fetchVibeToken(
-          refImage,
-          refInfoExtracted,
-          metadata.model,
-        );
-        if (this.vibeCache.size >= VIBE_CACHE_LIMIT) {
-          this.vibeCache.delete(this.vibeCache.keys().next().value!);
-        }
-        this.vibeCache.set(cacheKey, vibeToken);
-      }
-
-      encoded.push(vibeToken);
+      const info = metadata.reference_information_extracted_multiple?.[i] ?? 1;
+      encoded.push(
+        await this.fetchVibeToken(refImage, {
+          model: metadata.model,
+          informationExtracted: info,
+        }),
+      );
     }
 
     metadata.reference_image_multiple = encoded;
-    metadata.reference_information_extracted_multiple = undefined;
+    delete metadata.reference_information_extracted_multiple;
   }
 
-  /**
-   * Fetch vibe token from the API
-   */
   private async fetchVibeToken(
     image: string,
-    informationExtracted: number,
-    model: string,
+    options: EncodeVibeOptions,
   ): Promise<string> {
+    const model = options.model ?? Model.V4_5;
+    const info = options.informationExtracted ?? 1;
+    if (info < 0 || info > 1) {
+      throw new Error("informationExtracted must be between 0 and 1");
+    }
+
+    const mask = await this.resolveToBase64(options.mask);
+    const key = [
+      await this.getImageHash(image),
+      String(model),
+      String(info),
+      String(options.cropToMask ?? false),
+      String(options.focusSeed ?? ""),
+      String(options.infoExtractSeed ?? ""),
+      mask ? await this.getImageHash(mask) : "",
+    ].join(":");
+
+    const cached = this.vibeCache.get(key);
+    if (cached) return cached;
+
+    const body: EncodeVibeRequest = {
+      image,
+      model: String(model),
+      information_extracted: info,
+    };
+    if (mask) body.mask = mask;
+    if (options.cropToMask !== undefined) body.crop_to_mask = options.cropToMask;
+    if (options.focusSeed !== undefined) body.focus_seed = options.focusSeed;
+    if (options.infoExtractSeed !== undefined) {
+      body.info_extract_seed = options.infoExtractSeed;
+    }
+
     try {
-      const response = await this.request(
+      const { data } = await this.transport.buffer(
         `${this.host}${Endpoint.ENCODE_VIBE}`,
-        {
-          image,
-          information_extracted: informationExtracted,
-          model,
-        },
+        { body, accept: "application/octet-stream", idempotent: false },
       );
-      // The endpoint returns the vibe token as raw binary; the generation
-      // payload expects it base64-encoded
-      const buffer = await this.getResponseBuffer(response);
-      return uint8ArrayToBase64(new Uint8Array(buffer));
+      const token = uint8ArrayToBase64(data);
+      if (this.vibeCache.size >= VIBE_CACHE_LIMIT) {
+        this.vibeCache.delete(this.vibeCache.keys().next().value!);
+      }
+      this.vibeCache.set(key, token);
+      return token;
     } catch (error) {
       throw this.handleRequestError(error);
     }
@@ -768,7 +604,6 @@ export class NovelAI {
 
   /**
    * SHA-256 hash of a base64 image, used as vibe cache key.
-   * Uses Web Crypto, available in browsers and Node.js 18+.
    */
   private async getImageHash(base64Image: string): Promise<string> {
     const binaryString = atob(base64Image);
@@ -783,62 +618,34 @@ export class NovelAI {
       .join("");
   }
 
-  // ---- Text generation (OpenAI-compatible endpoints) ----
+  // ---- Text generation ----
 
   /**
-   * Generate a chat completion using NovelAI's text models
-   *
-   * @param messages - Chat messages, or a plain string treated as a single user message
-   * @param options - Generation options (model, max_tokens, temperature, ...)
-   * @returns Promise resolving to a ChatCompletion in OpenAI format
+   * Generate a chat completion (non-streaming).
    */
   async chat(
     messages: string | ChatMessage[],
     options: TextGenerationOptions = {},
   ): Promise<ChatCompletion> {
-    // The non-streaming chat endpoint currently returns raw token ids
-    // without decoded text, so assemble the completion from the streaming
-    // endpoint instead.
-    const stream = await this.chatStream(messages, options);
-
-    let id = "";
-    let model = "";
-    let created = 0;
-    let role: ChatMessage["role"] = "assistant";
-    let content = "";
-    let finishReason: string | null = null;
-    let usage: ChatCompletion["usage"];
-
-    for await (const chunk of stream) {
-      id = id || chunk.id;
-      model = model || chunk.model;
-      created = created || chunk.created;
-      const choice = chunk.choices?.[0];
-      if (choice?.delta?.role) role = choice.delta.role;
-      if (choice?.delta?.content) content += choice.delta.content;
-      if (choice?.finish_reason) finishReason = choice.finish_reason;
-      const chunkUsage = (chunk as any).usage;
-      if (chunkUsage) usage = chunkUsage;
-    }
-
-    return {
-      id,
-      object: "chat.completion",
-      created,
-      model,
-      choices: [
-        { index: 0, message: { role, content }, finish_reason: finishReason },
-      ],
-      usage,
+    const body = {
+      ...options,
+      model: options.model ?? TextModel.GLM_4_6,
+      messages: this.normalizeMessages(messages),
+      stream: false,
     };
+
+    try {
+      return await this.transport.json<ChatCompletion>(
+        `${this.textHost}${Endpoint.CHAT_COMPLETIONS}`,
+        { body, idempotent: false },
+      );
+    } catch (error) {
+      throw this.handleRequestError(error);
+    }
   }
 
   /**
-   * Generate a chat completion, streaming the response chunk by chunk
-   *
-   * @param messages - Chat messages, or a plain string treated as a single user message
-   * @param options - Generation options (model, max_tokens, temperature, ...)
-   * @returns AsyncGenerator of ChatCompletionChunk objects in OpenAI format
+   * Generate a chat completion as an OpenAI-style SSE stream.
    */
   async chatStream(
     messages: string | ChatMessage[],
@@ -851,24 +658,22 @@ export class NovelAI {
       stream: true,
     };
 
-    const response = await withRetry(
-      () =>
-        this.openStream(`${this.textHost}${Endpoint.CHAT_COMPLETIONS}`, body),
-      this.retryConfig,
-    );
-
-    return this.parseChatStream(response);
+    try {
+      const { response } = await this.transport.stream(
+        `${this.textHost}${Endpoint.CHAT_COMPLETIONS}`,
+        { body, accept: "text/event-stream", idempotent: false },
+      );
+      return this.parseChatStream(response);
+    } catch (error) {
+      throw this.handleRequestError(error);
+    }
   }
 
   /**
-   * Generate a raw text completion using NovelAI's text models
-   *
-   * @param prompt - The prompt to continue
-   * @param options - Generation options (model, max_tokens, temperature, ...)
-   * @returns Promise resolving to a Completion in OpenAI format
+   * Generate a raw text completion via the OpenAI-compatible endpoint.
    */
   async completion(
-    prompt: string,
+    prompt: CompletionPrompt,
     options: TextGenerationOptions = {},
   ): Promise<Completion> {
     const body = {
@@ -877,28 +682,157 @@ export class NovelAI {
       prompt,
       stream: false,
     };
-    return this.requestJson(`${this.textHost}${Endpoint.COMPLETIONS}`, body);
+    try {
+      return await this.transport.json<Completion>(
+        `${this.textHost}${Endpoint.COMPLETIONS}`,
+        { body, idempotent: false },
+      );
+    } catch (error) {
+      throw this.handleRequestError(error);
+    }
   }
 
   /**
-   * List available text generation models
-   *
-   * @returns Promise resolving to an array of model ids
+   * Generate text with the native `/ai/generate` protocol.
    */
-  async listTextModels(): Promise<string[]> {
-    const result = await withRetry(async () => {
-      const response = await fetch(`${this.textHost}${Endpoint.TEXT_MODELS}`, {
-        method: "GET",
-        headers: prepHeaders(this.headers),
-      });
-      if (!response.ok) {
-        throw await apiErrorFromResponse(response);
-      }
-      return response.json();
-    }, this.retryConfig);
+  async generateText(
+    prompt: string,
+    options: NativeTextOptions = {},
+  ): Promise<LMGenerationResponse> {
+    const body = this.buildNativeTextRequest(prompt, options);
+    try {
+      return await this.transport.json<LMGenerationResponse>(
+        `${this.textHost}${Endpoint.TEXT_GENERATE}`,
+        { body, idempotent: false },
+      );
+    } catch (error) {
+      throw this.handleRequestError(error);
+    }
+  }
 
-    const data = (result as any)?.data;
-    return Array.isArray(data) ? data.map((m: any) => m.id) : [];
+  /**
+   * Generate text with the native `/ai/generate-stream` protocol.
+   * Yields decoded token strings.
+   */
+  async generateTextStream(
+    prompt: string,
+    options: NativeTextOptions = {},
+  ): Promise<AsyncGenerator<string, void, unknown>> {
+    const body = this.buildNativeTextRequest(prompt, options);
+    try {
+      const { response } = await this.transport.stream(
+        `${this.textHost}${Endpoint.TEXT_GENERATE_STREAM}`,
+        { body, accept: "text/event-stream", idempotent: false },
+      );
+      return this.parseTextStream(response);
+    } catch (error) {
+      throw this.handleRequestError(error);
+    }
+  }
+
+  private buildNativeTextRequest(
+    prompt: string,
+    options: NativeTextOptions,
+  ): Record<string, unknown> {
+    const {
+      model = TextModel.GLM_4_6,
+      n_samples,
+      prefix,
+      max_length = 100,
+      use_string = true,
+      logit_bias_exp = [],
+      ...rest
+    } = options;
+
+    if (
+      !Number.isInteger(max_length) ||
+      max_length < 1 ||
+      max_length > 2048
+    ) {
+      throw new Error("max_length must be an integer between 1 and 2048");
+    }
+
+    const body: Record<string, unknown> = {
+      input: prompt,
+      model,
+      parameters: {
+        ...rest,
+        max_length,
+        use_string,
+        logit_bias_exp,
+      },
+    };
+    if (n_samples !== undefined) body.n_samples = n_samples;
+    if (prefix !== undefined) body.prefix = prefix;
+    return body;
+  }
+
+  /**
+   * Count tokens using the OpenAI-compatible token-count extension.
+   */
+  async countTokens(
+    prompt: string | string[],
+    options: { model?: string } = {},
+  ): Promise<OAITokenCountResponse> {
+    try {
+      return await this.transport.json<OAITokenCountResponse>(
+        `${this.textHost}${Endpoint.TOKEN_COUNT}`,
+        {
+          body: {
+            prompt,
+            model: options.model ?? TextModel.GLM_4_6,
+          },
+          idempotent: true,
+        },
+      );
+    } catch (error) {
+      throw this.handleRequestError(error);
+    }
+  }
+
+  /**
+   * List available text models with their full OpenAI model objects.
+   */
+  async listTextModels(): Promise<OpenAIModelInfo[]> {
+    try {
+      const result = await this.transport.json<OpenAIModelsResponse>(
+        `${this.textHost}${Endpoint.TEXT_MODELS}`,
+        { method: "GET", idempotent: true },
+      );
+      return Array.isArray(result?.data) ? result.data : [];
+    } catch (error) {
+      throw this.handleRequestError(error);
+    }
+  }
+
+  /**
+   * Text-to-speech.
+   */
+  async generateVoice(options: GenerateVoiceOptions): Promise<VoiceResult> {
+    if (!options.text) throw new Error("voice generation requires text");
+    if (options.voice === undefined) {
+      throw new Error("voice generation requires a voice id");
+    }
+    if (options.voice === -1 && !options.seed) {
+      throw new Error("seed is required when voice is -1");
+    }
+
+    try {
+      const { data, contentType } = await this.transport.buffer(
+        `${this.host}${Endpoint.VOICE}`,
+        {
+          body: options,
+          accept: "audio/webm, audio/mpeg",
+          idempotent: false,
+        },
+      );
+      return {
+        data,
+        mimeType: contentType.includes("webm") ? "audio/webm" : "audio/mpeg",
+      };
+    } catch (error) {
+      throw this.handleRequestError(error);
+    }
   }
 
   private normalizeMessages(messages: string | ChatMessage[]): ChatMessage[] {
@@ -907,9 +841,6 @@ export class NovelAI {
       : messages;
   }
 
-  /**
-   * Parse an OpenAI-style SSE stream into completion chunks
-   */
   private async *parseChatStream(
     response: Response,
   ): AsyncGenerator<ChatCompletionChunk, void, unknown> {
@@ -935,36 +866,37 @@ export class NovelAI {
     }
   }
 
-  /**
-   * Make a JSON request with timeout, retry and error handling
-   */
-  private async requestJson<T>(url: string, payload: unknown): Promise<T> {
-    return withRetry(async () => {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+  private async *parseTextStream(
+    response: Response,
+  ): AsyncGenerator<string, void, unknown> {
+    const sse = new SSEStream();
+    const reader = response.body!.getReader();
 
-      try {
-        if (this.verbose) {
-          console.debug(`[Request] ${url}`, JSON.stringify(payload));
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        for (const event of sse.feed(value)) {
+          if (event.data === "[DONE]") return;
+          let parsed: any;
+          try {
+            parsed = JSON.parse(event.data);
+          } catch {
+            continue;
+          }
+          if (parsed?.event_type === "error") {
+            throw new NovelAIStreamError(
+              String(parsed.message || "NovelAI text stream error"),
+              { event: parsed },
+            );
+          }
+          if (typeof parsed?.token === "string") yield parsed.token;
+          else if (typeof parsed?.text === "string") yield parsed.text;
         }
-
-        const response = await fetch(url, {
-          method: "POST",
-          headers: prepHeaders(this.headers),
-          body: JSON.stringify(payload),
-          signal: controller.signal,
-        });
-
-        if (!response.ok) {
-          throw await apiErrorFromResponse(response);
-        }
-
-        return (await response.json()) as T;
-      } catch (error) {
-        throw this.handleRequestError(error);
-      } finally {
-        clearTimeout(timeoutId);
       }
-    }, this.retryConfig);
+    } finally {
+      reader.releaseLock();
+    }
   }
 }

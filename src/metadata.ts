@@ -1,8 +1,10 @@
 import {
   Action,
+  ImageFormat,
   Model,
   Sampler,
   Noise,
+  StreamingType,
   isV4Model,
   isV5Model,
   Resolution,
@@ -204,7 +206,7 @@ export class MetadataProcessor {
     metadata.scale = metadata.scale ?? (isV5Model(metadata.model) ? 7.0 : 6.0);
     if (isV5Model(metadata.model)) {
       metadata.straight_alpha = metadata.straight_alpha ?? true;
-      metadata.image_format = metadata.image_format ?? "png";
+      metadata.image_format = metadata.image_format ?? ImageFormat.PNG;
       metadata.qualityPresetId = metadata.qualityPresetId ?? "standard";
       metadata.ucPresetId =
         metadata.ucPresetId ??
@@ -233,8 +235,6 @@ export class MetadataProcessor {
 
     this.applyDirectorReferenceDefaults(metadata);
     this.applyVibeTransferDefaults(metadata);
-
-    metadata.stream = undefined;
   }
 
   /**
@@ -305,11 +305,14 @@ export class MetadataProcessor {
   }
 
   /**
-   * V4 generate requests go through the streaming endpoint in msgpack format
+   * V4/V5 streams default to SSE (the documented framing). Callers can
+   * explicitly request msgpack; the decoder still sniffs the real response.
    */
   private handleStream(metadata: Metadata): void {
     if (isV4Model(metadata.model!)) {
-      metadata.stream = "msgpack";
+      metadata.stream = metadata.stream ?? StreamingType.SSE;
+    } else {
+      delete metadata.stream;
     }
   }
 
@@ -331,12 +334,15 @@ export class MetadataProcessor {
   }
 
   /**
-   * Drop V3-only settings for V4+ models
+   * Drop V3-only settings for V4+ models; default them for V3/Furry.
    */
   private handleModelSpecificSettings(metadata: Metadata): void {
     if (isV4Model(metadata.model!)) {
       metadata.sm = undefined;
       metadata.sm_dyn = undefined;
+    } else {
+      metadata.sm = metadata.sm ?? false;
+      metadata.sm_dyn = metadata.sm_dyn ?? false;
     }
   }
 
@@ -400,6 +406,8 @@ export class MetadataProcessor {
         metadata.img2img = {
           strength: metadata.inpaintImg2ImgStrength,
           color_correct: true,
+          noise: metadata.noise ?? 0,
+          extra_noise_seed: metadata.extra_noise_seed,
         };
       } else {
         delete metadata.img2img;
@@ -509,7 +517,23 @@ export class MetadataProcessor {
         `Total resolution must be between ${minPixels} and ${maxPixels} px, got ${metadata.width}x${metadata.height}=${totalPixels}.`,
       );
     }
+
+    const maxSamples = getMaxSamples(totalPixels);
+    if ((metadata.n_samples ?? 1) > maxSamples) {
+      throw new Error(
+        `n_samples must be at most ${maxSamples} for ${metadata.width}x${metadata.height}; got ${metadata.n_samples}.`,
+      );
+    }
   }
+}
+
+/** Maximum samples allowed by the API for a total pixel count. */
+function getMaxSamples(totalPixels: number): number {
+  if (totalPixels <= 512 * 704) return 8;
+  if (totalPixels <= 640 * 640) return 6;
+  if (totalPixels <= 1310720) return 4;
+  if (totalPixels <= 1572864) return 2;
+  return 1;
 }
 
 // Singleton instance for easy access

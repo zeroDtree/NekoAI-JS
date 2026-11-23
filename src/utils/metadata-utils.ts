@@ -1,5 +1,5 @@
 import { Metadata } from "../types";
-import { Action, Model, isV4Model, isV5Model } from "../constants";
+import { Action, isV4Model } from "../constants";
 
 /** Maximum total pixel count accepted by the generation API */
 export const MAX_PIXELS = 3047424;
@@ -25,52 +25,6 @@ export function scaleDimensions(
     Math.max(64, Math.floor((width * clamped) / 64) * 64),
     Math.max(64, Math.floor((height * clamped) / 64) * 64),
   ];
-}
-
-/**
- * Prepares metadata for API request
- * @param metadata - Processed metadata object
- * @returns Formatted API request payload
- */
-export function prepareMetadataForApi(metadata: Metadata): any {
-  // JSON round-trip drops undefined values (null is kept)
-  const params = JSON.parse(JSON.stringify(metadata));
-
-  // These go in the top level of the payload, not in parameters
-  delete params.model;
-  delete params.action;
-  delete params.prompt;
-  delete params.resPreset;
-  // V5 web requests include this list as well as the nested captions.
-  if (!isV5Model(metadata.model!)) delete params.characterPrompts;
-
-  if (isV5Model(metadata.model!)) {
-    delete params.qualityToggle;
-    delete params.ucPreset;
-    delete params.skip_cfg_above_sigma;
-    if (
-      metadata.model === Model.V5_MEDIUM ||
-      metadata.model === Model.V5_MEDIUM_INP
-    ) {
-      delete params.cfg_rescale;
-    }
-  }
-
-  // Client-side name -> API name
-  if (
-    params.inpaintImg2ImgStrength !== undefined &&
-    !isV5Model(metadata.model!)
-  ) {
-    params.inpaint_img2img_strength = params.inpaintImg2ImgStrength;
-    delete params.inpaintImg2ImgStrength;
-  }
-
-  return {
-    input: metadata.prompt,
-    model: metadata.model,
-    action: metadata.action,
-    parameters: params,
-  };
 }
 
 /**

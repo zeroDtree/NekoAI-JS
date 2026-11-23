@@ -37,7 +37,7 @@ async function testModelV45FullInpaintStream() {
         mask: mask.base64,
         sampler: Sampler.EULER_ANC,
       },
-      true,
+      { stream: true },
     );
 
     // Ensure output directory exists

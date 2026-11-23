@@ -43,3 +43,4 @@ npm-debug.log*
 # JSR files
 .jsr
 .jsrrc
+.comonad

@@ -7,7 +7,9 @@ export * from "./platform-utils";
 export * from "./fs-utils";
 export * from "./http-utils";
 export * from "./retry-utils";
+export * from "./transport";
 export * from "./image-utils";
+export * from "./image-payload";
 export * from "./metadata-utils";
 export * from "./tag-utils";
 

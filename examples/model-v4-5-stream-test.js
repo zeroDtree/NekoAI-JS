@@ -22,7 +22,7 @@ async function testModelV45Streaming() {
         resPreset: Resolution.NORMAL_PORTRAIT,
         sampler: Sampler.EULER_ANC,
       },
-      true,
+      { stream: true },
     );
 
     // Ensure output directory exists

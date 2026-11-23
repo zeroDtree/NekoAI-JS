@@ -1,7 +1,7 @@
 {
   "name": "nekoai-js",
-  "version": "1.4.0",
-  "description": "A lightweight JavaScript/TypeScript API for NovelAI image generation, director tools and text generation",
+  "version": "2.0.0",
+  "description": "A lightweight JavaScript/TypeScript API for NovelAI image generation, director tools, text generation, upscaling and voice",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",

@@ -1,0 +1,22 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "NovelAI generation-domain snapshot",
+    "version": "1.0"
+  },
+  "paths": {
+    "/ai/augment-image": { "post": {} },
+    "/ai/encode-vibe": { "post": {} },
+    "/ai/generate": { "post": {} },
+    "/ai/generate-image": { "post": {} },
+    "/ai/generate-image-stream": { "post": {} },
+    "/ai/generate-image/suggest-tags": { "get": {} },
+    "/ai/generate-stream": { "post": {} },
+    "/ai/generate-voice": { "post": {} },
+    "/ai/upscale": { "post": {} },
+    "/oa/v1/chat/completions": { "post": {} },
+    "/oa/v1/completions": { "post": {} },
+    "/oa/v1/internal/token-count": { "post": {} },
+    "/oa/v1/models": { "get": {} }
+  }
+}

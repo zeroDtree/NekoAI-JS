@@ -2,7 +2,7 @@
 
 <div align="center">
   <img src="https://raw.githubusercontent.com/Nya-Foundation/NekoAI-JS/main/assets/banner.png" alt="NekoAI-JS Banner" width="800" />
-  <p>A lightweight JavaScript/TypeScript client for the NovelAI API: image generation, Director tools, and text generation.</p>
+  <p>A lightweight JavaScript/TypeScript client for the NovelAI API: image generation, Director tools, text, upscaling and voice.</p>
 
   <div>
     <a href="https://github.com/Nya-Foundation/NekoAI-JS/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Nya-Foundation/nekoai-js.svg" alt="License"/></a>
@@ -18,15 +18,37 @@ NekoAI-JS wraps NovelAI's image and text generation APIs behind a small, strongl
 
 **Capabilities**
 
-- Image generation with V3, V4, and V4.5 models, including multi-character prompts, img2img, and inpainting
-- Real-time streaming of V4/V4.5 generation steps
+- Image generation with V3, V4, V4.5 and V5 models, including multi-character prompts, img2img, and inpainting
+- ZIP, JSON, SSE and msgpack image responses; real-time V4/V5 step streaming
 - Vibe transfer and character reference (director reference) for V4.5
-- Dedicated 2x/4x upscaling and img2img-based enhancement
+- Documented standalone upscale plus img2img-based enhancement
 - All Director tools: line art, sketch, background removal, declutter, colorize, emotion change
-- Text generation (chat and completions) through NovelAI's OpenAI-compatible endpoints, with streaming
+- Text generation through both the native `/ai/generate` API and OpenAI-compatible endpoints, with token counting
+- Text-to-speech through `/ai/generate-voice`
 - Tag autocomplete suggestions
 - Metadata extraction from AI-generated images (PNG text chunks, EXIF, NovelAI stealth LSB)
-- Automatic retries with exponential backoff, structured API errors, flexible image inputs
+- Structured API errors, stable correlation IDs, safe retry policy, flexible image inputs
+
+See [docs/API-ALIGNMENT.md](docs/API-ALIGNMENT.md) for the 13-path coverage matrix.
+The `/user/*` account domain is intentionally out of scope.
+
+## 2.0 Migration
+
+Version 2.0 is a breaking alignment release:
+
+| 1.x | 2.0 |
+| --- | --- |
+| `generateImage(metadata, true)` | `generateImage(metadata, { stream: true })` |
+| `generateImage(metadata, false, isOpus, forceZip)` | `generateImage(metadata, { format: "zip" \| "json", isOpus })` |
+| `upscale(image, 2 \| 4)` | `upscale(image, { model, declaredBlurSigma })` |
+| `Host.WEB` | `Host.IMAGE` |
+| `prepareMetadataForApi(metadata)` | `buildImagePayload(metadata)` |
+| `listTextModels(): string[]` | `listTextModels(): OpenAIModelInfo[]` |
+| automatic 429/timeout retries | 429 and timeouts are not retried by default |
+| stream framing guessed from action | explicit `streamFormat: "sse" \| "msgpack"` plus response sniffing |
+
+`generateImage` and `upscale` no longer accept positional compatibility
+overloads. See the method reference below for the final signatures.
 
 ## Requirements
 
@@ -73,7 +95,7 @@ The package is dual-published: `import { NovelAI } from "nekoai-js"` (ESM) and `
 ```ts
 const client = new NovelAI({
   token: "your_access_token", // required
-  host: Host.WEB,             // image API host (default: https://image.novelai.net)
+  host: Host.IMAGE,           // image API host (default: https://image.novelai.net)
   textHost: Host.TEXT,        // text API host (default: https://text.novelai.net)
   timeout: 120000,            // ms until the API responds, including generation time
   retry: {
@@ -81,11 +103,16 @@ const client = new NovelAI({
     maxRetries: 3,            // default: 3
     baseDelay: 1000,          // exponential backoff base, ms
     maxDelay: 30000,          // backoff cap, ms
-    retryStatusCodes: [429, 500, 502, 503, 504],
+    retryStatusCodes: [500, 502, 503, 504],
+    retryOnTimeout: false,    // don't re-send a possibly billed generation
+    retryNetworkErrors: true, // disabled automatically for generation POSTs
   },
   verbose: false,             // log payloads and estimated Anlas cost
 });
 ```
+
+`429` is not retried by default. The API docs state that rate-limited requests
+must not be retried, and retrying a timed-out generation can bill it twice.
 
 ## Image Generation
 
@@ -127,7 +154,7 @@ const images = await client.generateImage({
 | `Model.FURRY`         | `nai-diffusion-furry-3`             |
 | `Model.FURRY_INP`     | `nai-diffusion-furry-3-inpainting`  |
 
-V5 uses the streaming image endpoint and `params_version: 4`. Select a V5 model explicitly; the library default remains V4.5. V5 Full and Curated default to 32 steps and guidance 7. At normal resolution, 32 steps exceed the Opus 28 step allowance and use Anlas. Medium effort is fixed at 14 steps and Euler Ancestral. Medium effort rejects custom steps, sampler, undesired content, and guidance rescale. V5 requests PNG by default. Set `image_format: "webp"` to request WebP. Vibe transfer and director references are not available with V5. For V5 Curated inpainting, use `Model.V4_5_CUR_INP` until its V5 model is available.
+V5 uses the image streaming protocol and `params_version: 4`. Select a V5 model explicitly; the library default remains V4.5. V5 Full and Curated default to 32 steps and guidance 7. At normal resolution, 32 steps exceed the Opus 28 step allowance and use Anlas. Medium effort is fixed at 14 steps and Euler Ancestral. Medium effort rejects custom steps, sampler, undesired content, and guidance rescale. V5 requests PNG by default. Set `image_format: ImageFormat.WEBP` to request WebP. Vibe transfer and director references are not available with V5. For V5 Curated inpainting, use `Model.V4_5_CUR_INP` until its V5 model is available.
 
 ```ts
 const images = await client.generateImage({ prompt: "1girl, garden", model: Model.V5 });
@@ -146,14 +173,14 @@ const images = await client.generateImage({ prompt: "1girl, garden", model: Mode
 
 ### Streaming
 
-V4/V4.5 generations can stream each denoising step. Pass `true` as the second argument; the return type narrows to an async generator of `MsgpackEvent` objects.
+V4/V5 generations can stream each denoising step:
 
 ```ts
-import { EventType } from "nekoai-js";
+import { EventType, StreamingType } from "nekoai-js";
 
 const stream = await client.generateImage(
   { prompt: "1girl, night sky", model: Model.V4_5 },
-  true,
+  { stream: true, streamFormat: StreamingType.SSE },
 );
 
 for await (const event of stream) {
@@ -165,7 +192,22 @@ for await (const event of stream) {
 }
 ```
 
+`streamFormat` defaults to `"sse"`. Pass `"msgpack"` for the legacy V4 framing;
+the decoder also sniffs ZIP/msgpack/SSE from the actual response, so a server
+that returns a different framing still works. Stream errors throw
+`NovelAIStreamError`, and a stream without a final image throws instead of
+silently returning nothing.
+
 Streaming with a V3 model throws, since V3 only returns final images.
+
+Non-stream responses support ZIP (default) or JSON:
+
+```ts
+const images = await client.generateImage(
+  { prompt: "1girl", model: Model.V4_5 },
+  { format: "json" }, // sets Accept: application/json and preserves seed/index
+);
+```
 
 ### Image inputs
 
@@ -268,8 +310,11 @@ Use `base_caption: "character"` to transfer only the character, or `"character&s
 ### Upscale and enhance
 
 ```ts
-// Dedicated upscaler (api.novelai.net); pixels preserved, no re-generation
-const upscaled = await client.upscale("./output/image.png", 2); // scale: 2 or 4
+// Documented standalone upscaler; pixels preserved, no re-generation
+const upscaled = await client.upscale("./output/image.png", {
+  model: Model.V4_5,
+  declaredBlurSigma: 0.3, // optional: 0, 0.30, 0.35, 0.40, 0.45, 0.50
+});
 await upscaled.save("./output/upscaled.png");
 
 // Enhance: img2img re-generation at a scaled-up resolution
@@ -312,12 +357,15 @@ An optional second argument selects the model (`Model.V4_5` by default) and a th
 
 ## Text Generation
 
-Text generation uses NovelAI's OpenAI-compatible endpoints on `text.novelai.net`. Query the live model list with `listTextModels()`; the `TextModel` enum covers the currently available ids (`glm-4-6`, `xialong-v1`).
+Text generation is available through both the native `/ai/generate` endpoints
+and NovelAI's OpenAI-compatible endpoints on `text.novelai.net`. Query the live
+model list with `listTextModels()`; the `TextModel` enum is only a convenience
+alias and is not a whitelist.
 
 ```ts
 import { TextModel } from "nekoai-js";
 
-const models = await client.listTextModels();
+const models = await client.listTextModels(); // [{ id, object, created, owned_by }]
 
 // Chat completion; a plain string becomes a single user message
 const completion = await client.chat("Describe a cozy tavern in one sentence.", {
@@ -350,7 +398,42 @@ const continuation = await client.completion("The old lighthouse keeper", {
 console.log(continuation.choices[0].text);
 ```
 
-Options follow the OpenAI parameter names (`max_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `frequency_penalty`, `presence_penalty`, `stop`, `seed`, `logit_bias`, `n`); unknown keys are passed through to the API unchanged.
+Options follow the OpenAI parameter names (`max_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `frequency_penalty`, `presence_penalty`, `stop`, `seed`, `logit_bias`, `n`, `best_of`, `echo`, `logprobs`, `suffix`, `user`, `enable_thinking`, `generation_prefix`, `unified_*`); unknown keys are passed through unchanged.
+
+### Native text API
+
+```ts
+const result = await client.generateText("The old lighthouse keeper", {
+  model: TextModel.ERATO,
+  max_length: 120,
+  temperature: 0.9,
+});
+console.log(result.output);
+
+const stream = await client.generateTextStream("Once upon a time");
+for await (const token of stream) process.stdout.write(token);
+```
+
+`generateText` always sends the required `logit_bias_exp: []` (unless you
+provide one) and `use_string: true`. `max_length` must be between 1 and 2048.
+
+### Token count
+
+```ts
+const { encoded, length } = await client.countTokens("1girl, blue hair");
+```
+
+### Voice
+
+```ts
+const audio = await client.generateVoice({
+  text: "Hello from NovelAI",
+  voice: 1,       // or -1 with a seed
+  opus: true,     // audio/webm; false returns audio/mpeg
+  version: "v2",
+});
+await Bun.write("./output/voice.webm", audio.data);
+```
 
 ## Working with Results
 
@@ -382,7 +465,8 @@ const summary = await getImageSummary("./image.png");
 
 ## Error Handling
 
-API failures throw `NovelAIApiError`, which carries the HTTP status and the error message returned by the API:
+API failures throw `NovelAIApiError`, which carries the HTTP status, the API
+`details`, the body `statusCode`, the correlation ID and the error message:
 
 ```ts
 import { NovelAIApiError } from "nekoai-js";
@@ -391,28 +475,37 @@ try {
   await client.generateImage({ prompt: "1girl" });
 } catch (err) {
   if (err instanceof NovelAIApiError) {
-    console.error(err.status, err.message); // e.g. 402 "Not enough Anlas"
+    console.error(err.status, err.message, err.correlationId);
   }
 }
 ```
 
-Retryable failures (rate limits, 5xx responses, network errors, timeouts) are retried automatically with exponential backoff and jitter according to the client's `retry` configuration. Set `retry: { enabled: false }` to disable.
+Only `500/502/503/504` are retried by default, with exponential backoff and
+jitter. `429` and timeouts are **not** retried: the docs forbid retrying rate
+limits, and a timed-out generation may already have been billed. Retry behavior
+is configurable through `retry`; non-idempotent generation requests never retry
+network errors or timeouts.
 
 ## Method Reference
 
 | Method | Description |
 | ------ | ----------- |
-| `generateImage(metadata, stream?, isOpus?)` | Generate images; `stream: true` returns an async generator of step events |
+| `generateImage(metadata, options?)` | Generate images; `{ stream: true, streamFormat }`, `{ format: "zip" \| "json" }` |
 | `enhance(image, options?)` | img2img re-generation at a scaled-up resolution |
-| `upscale(image, scale?)` | Dedicated 2x/4x upscaler |
+| `upscale(image, options?)` | Documented standalone upscaler (`model`, `declaredBlurSigma`) |
+| `encodeVibe(image, options?)` | Encode a vibe token (`mask`, crop and seed options) |
 | `lineArt(image)` / `sketch(image)` / `backgroundRemoval(image)` / `declutter(image)` | Director tools |
 | `colorize(image, prompt?, defry?)` | Colorize sketch or line art |
 | `changeEmotion(image, emotion?, prompt?, level?)` | Change a character's emotion |
 | `suggestTags(prompt, model?, lang?)` | Tag autocomplete |
-| `chat(messages, options?)` | Chat completion (OpenAI format) |
+| `chat(messages, options?)` | Non-streaming chat completion (OpenAI format) |
 | `chatStream(messages, options?)` | Streaming chat completion |
 | `completion(prompt, options?)` | Raw text completion |
-| `listTextModels()` | Available text model ids |
+| `generateText(prompt, options?)` | Native `/ai/generate` |
+| `generateTextStream(prompt, options?)` | Native `/ai/generate-stream` token stream |
+| `countTokens(prompt, options?)` | `/oa/v1/internal/token-count` |
+| `generateVoice(options)` | Text-to-speech |
+| `listTextModels()` | Available text model objects |
 | `useDirectorTool(request)` | Low-level director tool access |
 
 ## Browser Usage

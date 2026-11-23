@@ -7,22 +7,51 @@ export const HEADERS = {
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0",
 };
 
+/**
+ * NovelAI API hosts. Each endpoint is served by exactly one host.
+ */
 export enum Host {
-  WEB = "https://image.novelai.net",
-  API = "https://api.novelai.net",
+  /** Image generation, Director tools, vibe, upscale and voice endpoints */
+  IMAGE = "https://image.novelai.net",
+  /** Text generation and OpenAI-compatible endpoints */
   TEXT = "https://text.novelai.net",
 }
 
+/**
+ * Generation-domain paths implemented by this library, all taken from the
+ * official NovelAI OpenAPI document.
+ */
 export enum Endpoint {
+  // Image host
   IMAGE = "/ai/generate-image",
   IMAGE_STREAM = "/ai/generate-image-stream",
   DIRECTOR = "/ai/augment-image",
   ENCODE_VIBE = "/ai/encode-vibe",
   SUGGEST_TAGS = "/ai/generate-image/suggest-tags",
   UPSCALE = "/ai/upscale",
+  VOICE = "/ai/generate-voice",
+  // Text host
   CHAT_COMPLETIONS = "/oa/v1/chat/completions",
   COMPLETIONS = "/oa/v1/completions",
   TEXT_MODELS = "/oa/v1/models",
+  TOKEN_COUNT = "/oa/v1/internal/token-count",
+  TEXT_GENERATE = "/ai/generate",
+  TEXT_GENERATE_STREAM = "/ai/generate-stream",
+}
+
+/** Image encoding returned by the generation endpoints */
+export enum ImageFormat {
+  PNG = "png",
+  WEBP = "webp",
+}
+
+/**
+ * Event stream flavor requested through `parameters.stream`.
+ * The decoder still sniffs the actual response (ZIP / msgpack / SSE).
+ */
+export enum StreamingType {
+  MSGPACK = "msgpack",
+  SSE = "sse",
 }
 
 export enum Model {
@@ -81,13 +110,30 @@ export function isV5Model(model: Model): boolean {
   );
 }
 
+/** V5 Medium variants use a restricted parameter set. */
+export function isV5MediumModel(model: Model): boolean {
+  return model === Model.V5_MEDIUM || model === Model.V5_MEDIUM_INP;
+}
+
+export type ImageModelFamily = "v3" | "v4" | "v5";
+
+/** Classify an image model for request-parameter projection. */
+export function getImageModelFamily(model: Model): ImageModelFamily {
+  if (isV5Model(model)) return "v5";
+  if (isV4Model(model)) return "v4";
+  return "v3";
+}
+
 /**
- * Text generation models available through the OpenAI-compatible endpoints
- * on https://text.novelai.net (use client.listTextModels() for the live list)
+ * Text generation models known to this client. The live list is returned by
+ * `client.listTextModels()`; this enum is only a convenience alias.
  */
 export enum TextModel {
   GLM_4_6 = "glm-4-6",
   XIALONG = "xialong-v1",
+  ERATO = "llama-3-erato-v1",
+  KAYRA = "kayra-v1",
+  CLIO = "clio-v1",
 }
 
 export enum Controlnet {

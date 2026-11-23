@@ -1,7 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { MetadataProcessor } from "../src/metadata";
-import { Action, Model, Resolution, Sampler } from "../src/constants";
-import { calculateCost, prepareMetadataForApi } from "../src/utils";
+import {
+  Action,
+  ImageFormat,
+  Model,
+  Resolution,
+  Sampler,
+  StreamingType,
+} from "../src/constants";
+import { buildImagePayload, calculateCost } from "../src/utils";
 import type { Metadata } from "../src/types";
 
 const processor = new MetadataProcessor();
@@ -14,13 +21,13 @@ describe("V5 payloads", () => {
     [Model.V5_INP, 32],
   ])("builds the V4 prompt protocol for %s", (model, steps) => {
     const processed = processor.processMetadata({ prompt: "1girl", model });
-    const payload = prepareMetadataForApi(processed);
+    const payload = buildImagePayload(processed);
     expect(payload.model).toBe(model);
     expect(payload.parameters).toMatchObject({
       params_version: 4,
       steps,
       scale: 7,
-      stream: "msgpack",
+      stream: "sse",
       image_format: "png",
       straight_alpha: true,
       qualityPresetId: "standard",
@@ -36,8 +43,7 @@ describe("V5 payloads", () => {
     if (model !== Model.V5_CUR) {
       expect(payload.parameters.inpaintImg2ImgStrength).toBe(1);
       expect(payload.parameters.inpaint_img2img_strength).toBeUndefined();
-    }
-  });
+    }  });
 
   it("rejects unsupported Medium settings and V5 references", () => {
     expect(() =>
@@ -66,13 +72,13 @@ describe("V5 payloads", () => {
   it("allows WebP when selected explicitly", () => {
     const result = processor.processMetadata({
       model: Model.V5,
-      image_format: "webp",
+      image_format: ImageFormat.WEBP,
     });
-    expect(result.image_format).toBe("webp");
+    expect(result.image_format).toBe(ImageFormat.WEBP);
   });
 
   it("keeps positioned V5 character captions in the request", () => {
-    const payload = prepareMetadataForApi(
+    const payload = buildImagePayload(
       processor.processMetadata({
         model: Model.V5,
         prompt: "2girls",
@@ -244,7 +250,7 @@ describe("MetadataProcessor", () => {
 
   it("sets streaming format for V4 generate", () => {
     const v4 = processor.processMetadata({ model: Model.V4_5 });
-    expect(v4.stream).toBe("msgpack");
+    expect(v4.stream).toBe(StreamingType.SSE);
     const v3 = processor.processMetadata({ model: Model.V3 });
     expect(v3.stream).toBeUndefined();
   });
@@ -307,7 +313,7 @@ describe("inpaint img2img strength (V4.5)", () => {
     expect(result.strength).toBe(0.35);
     expect(result.inpaintImg2ImgStrength).toBe(1);
     expect(result.img2img).toBeUndefined();
-    const payload = prepareMetadataForApi(result);
+    const payload = buildImagePayload(result);
     expect(payload.parameters.inpaintImg2ImgStrength).toBe(1);
     expect(payload.parameters.inpaint_img2img_strength).toBeUndefined();
   });
@@ -317,7 +323,11 @@ describe("inpaint img2img strength (V4.5)", () => {
       action: Action.INPAINT,
       inpaintImg2ImgStrength: 0.5,
     });
-    expect(result.img2img).toEqual({ strength: 0.5, color_correct: true });
+    expect(result.img2img).toMatchObject({
+      strength: 0.5,
+      color_correct: true,
+      noise: 0,
+    });
   });
 
   it("omits the img2img object at full strength", () => {
@@ -340,7 +350,7 @@ describe("inpaint img2img strength (V4.5)", () => {
   });
 });
 
-describe("prepareMetadataForApi", () => {
+describe("buildImagePayload", () => {
   const processed = processor.processMetadata({
     prompt: "1girl",
     model: Model.V4_5,
@@ -348,7 +358,7 @@ describe("prepareMetadataForApi", () => {
     inpaintImg2ImgStrength: 0.7,
     characterPrompts: [{ prompt: "1girl" }],
   });
-  const payload = prepareMetadataForApi(processed);
+  const payload = buildImagePayload(processed);
 
   it("puts prompt/model/action at the top level", () => {
     expect(payload.model).toBe(Model.V4_5);
@@ -359,19 +369,79 @@ describe("prepareMetadataForApi", () => {
     expect(payload.parameters.resPreset).toBeUndefined();
   });
 
-  it("converts inpaintImg2ImgStrength to inpaint_img2img_strength", () => {
-    expect(payload.parameters.inpaint_img2img_strength).toBe(0.7);
-    expect(payload.parameters.inpaintImg2ImgStrength).toBeUndefined();
+  it("keeps inpaintImg2ImgStrength in camelCase", () => {
+    expect(payload.parameters.inpaintImg2ImgStrength).toBe(0.7);
+    expect(payload.parameters.inpaint_img2img_strength).toBeUndefined();
   });
 
-  it("removes characterPrompts (already folded into v4_prompt)", () => {
-    expect(payload.parameters.characterPrompts).toBeUndefined();
+  it("keeps characterPrompts alongside v4_prompt", () => {
+    expect(payload.parameters.characterPrompts).toEqual([
+      {
+        prompt: "1girl",
+        uc: "lowres, aliasing",
+        center: { x: 0.5, y: 0.5 },
+        enabled: true,
+      },
+    ]);
     expect(payload.parameters.v4_prompt).toBeDefined();
   });
 
   it("keeps null values but drops undefined ones", () => {
     expect(payload.parameters.skip_cfg_above_sigma).toBeNull();
     expect("sm" in payload.parameters).toBe(false);
+  });
+});
+
+describe("model-family projection", () => {
+  it("keeps legacy SMEA fields and drops V4-only fields for V3", () => {
+    const payload = buildImagePayload(
+      processor.processMetadata({ model: Model.V3, prompt: "1girl" }),
+    );
+    expect(payload.parameters.sm).toBe(false);
+    expect(payload.parameters.sm_dyn).toBe(false);
+    expect(payload.parameters.autoSmea).toBeUndefined();
+    expect(payload.parameters.use_coords).toBeUndefined();
+    expect(payload.parameters.v4_prompt).toBeUndefined();
+  });
+
+  it("keeps V4 prompt structures and drops SMEA/V5 fields for V4.5", () => {
+    const payload = buildImagePayload(
+      processor.processMetadata({
+        model: Model.V4_5,
+        prompt: "1girl",
+        sm: true,
+      }),
+    );
+    expect(payload.parameters.v4_prompt).toBeDefined();
+    expect(payload.parameters.characterPrompts).toEqual([]);
+    expect(payload.parameters.sm).toBeUndefined();
+    expect(payload.parameters.qualityPresetId).toBeUndefined();
+  });
+
+  it("drops qualityToggle/ucPreset for V5", () => {
+    const payload = buildImagePayload(
+      processor.processMetadata({ model: Model.V5, prompt: "1girl" }),
+    );
+    expect(payload.parameters.qualityToggle).toBeUndefined();
+    expect(payload.parameters.ucPreset).toBeUndefined();
+    expect(payload.parameters.qualityPresetId).toBe("standard");
+  });
+});
+
+describe("n_samples validation", () => {
+  it("allows 8 samples at small resolutions", () => {
+    const result = processor.processMetadata({
+      width: 512,
+      height: 704,
+      n_samples: 8,
+    });
+    expect(result.n_samples).toBe(8);
+  });
+
+  it("rejects too many samples for the resolution", () => {
+    expect(() =>
+      processor.processMetadata({ width: 512, height: 704, n_samples: 9 }),
+    ).toThrow(/n_samples/);
   });
 });
 

@@ -6,7 +6,10 @@ import {
   StreamingSSEParser,
   parseStreamEvents,
   NovelAIApiError,
+  NovelAIStreamError,
   apiErrorFromResponse,
+  decodeBufferedImageResponse,
+  detectImageFormat,
   handleResponse,
 } from "../src/utils";
 import { EventType } from "../src/image";
@@ -124,23 +127,71 @@ describe("parseStreamEvents", () => {
   });
 
   it("auto-detects SSE format", () => {
-    const payload = JSON.stringify({ ...finalEvent, image: "" });
+    const payload = JSON.stringify({
+      ...finalEvent,
+      image: Buffer.from(finalEvent.image).toString("base64"),
+    });
     const events = parseStreamEvents(
       new TextEncoder().encode(`data: ${payload}\n\n`),
     );
     expect(events).toHaveLength(1);
+  });
+
+  it("detects ZIP, SSE and msgpack payloads", () => {
+    expect(
+      detectImageFormat(new Uint8Array([0x50, 0x4b, 0x03, 0x04])),
+    ).toBe("zip");
+    expect(
+      detectImageFormat(new TextEncoder().encode("data: {}\n\n")),
+    ).toBe("sse");
+    expect(
+      detectImageFormat(msgpackFrame(finalEvent)),
+    ).toBe("msgpack");
+  });
+
+  it("throws on an error event", () => {
+    const payload = JSON.stringify({
+      event_type: "error",
+      gen_id: "err-1",
+      message: "generation failed",
+    });
+    expect(() =>
+      parseStreamEvents(
+        new TextEncoder().encode(`data: ${payload}\n\n`),
+      ),
+    ).toThrow(NovelAIStreamError);
+  });
+
+  it("decodes buffered msgpack responses", async () => {
+    const images = await decodeBufferedImageResponse(
+      msgpackFrame(finalEvent),
+      "application/x-msgpack",
+    );
+    expect(images).toHaveLength(1);
+    expect(images[0].index).toBe(0);
   });
 });
 
 describe("error handling", () => {
   it("extracts the API message from a JSON error body", async () => {
     const response = new Response(
-      JSON.stringify({ statusCode: 402, message: "Not enough Anlas" }),
-      { status: 402, statusText: "Payment Required" },
+      JSON.stringify({
+        statusCode: 402,
+        message: "Not enough Anlas",
+        details: { anlas: 0 },
+      }),
+      {
+        status: 402,
+        statusText: "Payment Required",
+        headers: { "x-correlation-id": "ABC123" },
+      },
     );
     const error = await apiErrorFromResponse(response);
     expect(error).toBeInstanceOf(NovelAIApiError);
     expect(error.status).toBe(402);
+    expect(error.statusCode).toBe(402);
+    expect(error.details).toEqual({ anlas: 0 });
+    expect(error.correlationId).toBe("ABC123");
     expect(error.message).toContain("Not enough Anlas");
   });
 
